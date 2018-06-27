@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 import time
 import requests
@@ -7,36 +8,51 @@ import logging
 import csv
 from itertools import cycle
 from lxml import etree
+from urllib.request import url2pathname
+from urllib.parse import urljoin, urlparse
+from abc import ABC, abstractmethod
 
 FREE_PROXY_LIST_NET_URL = 'https://free-proxy-list.net/'
 
 
-class Downloader:
-    def __init__(self, user_agent_pool=None, proxy_pool=None, delayer=None):
+class Loader(ABC):
+
+    @abstractmethod
+    def get_content(self, location):
+        pass
+
+
+class Downloader(Loader):
+
+    def __init__(self, user_agent_pool, proxy_pool, delayer):
         self.user_agent_pool = user_agent_pool
         self.proxy_pool = proxy_pool
         self.delayer = delayer
 
-    def download(self, url):
-        if '://' not in url:
-            url = 'http://' + url
-
-        if self.delayer:
-            self.delayer.sleep()
+    def get_content(self, location):
+        if '://' not in location:
+            location = 'http://' + location
 
         max_retry = 5
         for request_count in range(1, max_retry + 1):
             try:
+                self.delayer.sleep()
+
+                logging.debug('Downloading %s ...', location)
+
                 headers = None
                 if self.user_agent_pool:
-                    headers = {'User-Agent': self.user_agent_pool.get_user_agent()}
+                    user_agent = self.user_agent_pool.get_user_agent()
+                    logging.debug('User agent: %s', user_agent)
+                    headers = {'User-Agent': user_agent}
 
                 proxies = None
                 if self.proxy_pool:
                     proxy = self.proxy_pool.get_proxy()
+                    logging.debug('Proxy: %s', proxy)
                     proxies = {'http': proxy, 'https': proxy}
 
-                response = requests.get(url, headers=headers, proxies=proxies)
+                response = requests.get(location, headers=headers, proxies=proxies)
                 content = response.text
                 if is_captcha(content):
                     raise Exception('Got captcha page')
@@ -46,10 +62,33 @@ class Downloader:
                 logging.warning(str(e))
                 logging.debug('Retry left: %d', max_retry - request_count)
 
-        raise Exception('Cannot download from ' + url)
+        raise Exception('Cannot download from ' + location)
+
+
+class FileLoader(Loader):
+
+    def __init__(self, save_dir):
+        self.save_dir = save_dir
+
+    def get_content(self, location):
+        load_file_path = location
+
+        # look for the end '/' of url and append index.html
+        if load_file_path.endswith('/'):
+            load_file_path += 'index.html'
+
+        # remove the start '/' of url
+        if load_file_path.startswith('/'):
+            load_file_path = load_file_path[1:]
+
+        load_file_path = os.path.join(self.save_dir, load_file_path)
+
+        with open(load_file_path, 'r', encoding='utf-8') as f:
+            return f.read()
 
 
 class RandomizeUserAgents:
+
     def __init__(self, ua_file=None, ua_list=None):
         self.user_agents = set()
         if ua_file:
@@ -60,12 +99,11 @@ class RandomizeUserAgents:
             self.user_agents |= set(ua_list)
 
     def get_user_agent(self):
-        user_agent = random.choice(tuple(self.user_agents))
-        logging.debug('User agent: %s s', user_agent)
-        return user_agent
+        return random.choice(tuple(self.user_agents))
 
 
 class CycleProxies:
+
     def __init__(self, proxy_file=None, proxy_list=None):
         proxies = set()
         if proxy_file:
@@ -77,12 +115,11 @@ class CycleProxies:
         self.proxy_cycle = cycle(proxies)
 
     def get_proxy(self):
-        proxy = next(self.proxy_cycle)
-        logging.debug('Proxy: %s', proxy)
-        return proxy
+        return next(self.proxy_cycle)
 
 
 class RandomizeSleep:
+
     def __init__(self, range_from, range_to):
         self.range_from = range_from
         self.range_to = range_to
@@ -91,6 +128,59 @@ class RandomizeSleep:
         delay = random.uniform(float(self.range_from), float(self.range_to))
         logging.debug('Delay: %s s', delay)
         time.sleep(delay)
+
+
+class Scraper:
+
+    def __init__(self, source, max_page=0, save_dir=''):
+        self.source = source
+        self.max_page = max_page
+        self.save_dir = save_dir
+        self.page_num = 0
+
+    def url_to_file_path(self, url):
+        url_path = urlparse(url).path
+        if url_path.endswith('/'):
+            url_path += 'index.html'
+        if url_path.startswith('/'):
+            url_path = url_path[1:]
+        return url2pathname(url_path)
+
+    def scrape(self, url, xml_paths, next_page_xml_path):
+
+        content = self.source.get_content(url)
+        if self.save_dir:
+            save_file_path = os.path.join(self.save_dir, self.url_to_file_path(url))
+            os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
+            with open(save_file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+        html_parser = etree.HTMLParser()
+        root = etree.fromstring(content, parser=html_parser)
+
+        # parse
+        table_cols = []
+        for xml_path in xml_paths:
+            col_values = []
+            elements = root.xpath(xml_path)
+            for element in elements:
+                element_text = get_text_content(element)
+                col_values.append(element_text)
+            table_cols.append(col_values)
+
+        # transpose cols to rows
+        yield from zip(*table_cols)
+
+        if int(self.max_page) == self.page_num + 1:
+            return
+
+        self.page_num += 1
+
+        if next_page_xml_path:
+            next_page_element = root.xpath(next_page_xml_path)
+            if len(next_page_element) > 0 and 'href' in next_page_element[0].attrib:
+                next_page_location = urljoin(url, next_page_element[0].attrib.get('href'))
+                yield from self.scrape(next_page_location, xml_paths, next_page_xml_path)
 
 
 def is_captcha(content):
@@ -103,7 +193,8 @@ def get_proxies_from_free_proxy_list_net():
     # this function can break if the free-proxy-list.net html structure changed
 
     response = requests.get(FREE_PROXY_LIST_NET_URL)
-    root = etree.HTML(response.text)
+    html_parser = etree.HTMLParser()
+    root = etree.fromstring(response.text, parser=html_parser)
 
     row_ctr = 0
     proxies = set()
@@ -137,76 +228,10 @@ def get_text_content(element):
     return content.strip()
 
 
-def read_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return f.read()
-
-
-def read_file_to_lines(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return f.readlines()
-
-
-def write_file(content, filepath):
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-
-def write_csv_file(rows, csv_file):
-    with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        for row in rows:
-            writer.writerow(row)
-
-
-def print_csv(rows):
-    writer = csv.writer(sys.stdout)
+def print_csv(rows, f):
+    writer = csv.writer(f)
     for row in rows:
         writer.writerow(row)
-
-
-def download_web_page(args):
-    user_agent_pool = None
-    if args.user_agent_file:
-        user_agent_pool = RandomizeUserAgents(args.user_agent_file)
-
-    proxy_pool = None
-    if args.proxy or args.proxy_file:
-        proxy_list = get_proxies_from_free_proxy_list_net() if args.proxy else []
-        proxy_pool = CycleProxies(args.proxy_file, proxy_list)
-
-    (delay_from, delay_to) = args.delay_range.split('-', 2)
-    delayer = RandomizeSleep(float(delay_from), float(delay_to))
-
-    downloader = Downloader(user_agent_pool, proxy_pool, delayer)
-    return downloader.download(args.url)
-
-
-def scrape_web_page(web_content, xml_paths):
-
-    html_parser = etree.HTMLParser()
-    root = etree.fromstring(web_content, parser=html_parser)
-
-    # scrape columns
-    table_header = []
-    table_cols = []
-    for xml_path in xml_paths:
-        table_header.append(xml_path)
-
-        col_values = []
-        elements = root.xpath(xml_path)
-        for element in elements:
-            element_text = get_text_content(element)
-            col_values.append(element_text)
-        table_cols.append(col_values)
-
-    # transpose cols to rows
-    table_rows = []
-    for table_row in zip(*table_cols):
-        table_rows.append(table_row)
-
-    table_rows.insert(0, table_header)
-    return table_rows
 
 
 def parse_arg():
@@ -223,9 +248,9 @@ def parse_arg():
     parser.add_argument('-p', '--proxy',
                         action='store_true',
                         help='rotate proxies from ' + FREE_PROXY_LIST_NET_URL)
-    parser.add_argument('-s', '--save-file',
-                        metavar='FILE',
-                        help='save web page')
+    parser.add_argument('-s', '--save-dir',
+                        metavar='DIR',
+                        help='save web pages to this directory')
     parser.add_argument('-a', '--user-agent-file',
                         metavar='FILE',
                         help='randomize user agents from list file')
@@ -238,8 +263,14 @@ def parse_arg():
                              nargs='+',
                              help='xpaths for the columns')
     xpath_group.add_argument('--xpath-file',
-                         metavar='FILE',
-                         help='file containing the xpaths for the columns')
+                             metavar='FILE',
+                             help='file containing the xpaths for the columns')
+    parser.add_argument('--next-page-xpath',
+                        metavar='XPATH',
+                        help='xpath containing the href url to next page')
+    parser.add_argument('--max-page',
+                        default='0',
+                        help='scrape (next) pages up to max page (default is to scrape all pages)')
     parser.add_argument('-o', '--output-file',
                         metavar='FILE',
                         help='save scrape data to csv file')
@@ -250,6 +281,7 @@ def parse_arg():
 
 def main():
     try:
+        # setup logging
         logging.basicConfig(filename='web_scraper.log',
                             filemode='w',
                             format='%(levelname)s:%(message)s',
@@ -259,15 +291,52 @@ def main():
         logging.getLogger('').addHandler(console)
 
         args = parse_arg()
-        content = read_file(args.file) if args.file else download_web_page(args)
-        if args.save_file:
-            write_file(content, args.save_file)
-        xml_paths = read_file_to_lines(args.xpath_file) if args.xpath_file else args.xpaths
-        table = scrape_web_page(content, xml_paths)
+
+        loader = None
+        location = None
+        if args.url:
+            # prepare randomize user agent
+            user_agent_pool = None
+            if args.user_agent_file:
+                user_agent_pool = RandomizeUserAgents(args.user_agent_file)
+
+            # prepare randomize proxy
+            proxy_pool = None
+            if args.proxy or args.proxy_file:
+                proxy_list = get_proxies_from_free_proxy_list_net() if args.proxy else []
+                proxy_pool = CycleProxies(args.proxy_file, proxy_list)
+
+            # prepare randomize delay between downloads
+            (delay_from, delay_to) = args.delay_range.split('-', 2)
+            delayer = RandomizeSleep(float(delay_from), float(delay_to))
+
+            loader = Downloader(user_agent_pool, proxy_pool, delayer)
+            location = args.url
+        elif args.file:
+            if not os.path.isfile(args.file):
+                raise Exception('Cannot find input file: ' + args.file)
+
+            loader = FileLoader(os.path.dirname(args.file))
+            location = os.path.basename(args.file)
+
+        # prepare xpath list
+        xml_paths = None
+        if args.xpath_file:
+            with open(args.xpath_file, 'r', encoding='utf-8') as f:
+                xml_paths = f.readlines()
+        elif args.xpaths:
+            xml_paths = args.xpaths
+
+        # scrape pages
+        scraper = Scraper(loader, args.max_page, args.save_dir)
+        table = scraper.scrape(location, xml_paths, args.next_page_xpath)
+
+        # save/print output
         if args.output_file:
-            write_csv_file(table, args.output_file)
+            with open(args.output_file, 'w', newline='', encoding='utf-8') as f:
+                print_csv(table, f)
         else:
-            print_csv(table)
+            print_csv(table, sys.stdout)
 
     except Exception as e:
         logging.error(str(e))
